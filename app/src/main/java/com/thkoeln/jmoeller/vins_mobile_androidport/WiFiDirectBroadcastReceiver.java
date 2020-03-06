@@ -54,6 +54,7 @@ public class WiFiDirectBroadcastReceiver extends BroadcastReceiver {
             this.thisDeviceMac = "";
         }
 
+
         @Override
         public void onReceive(Context context, Intent intent) {
             String action = intent.getAction();

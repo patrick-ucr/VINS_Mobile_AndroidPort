@@ -5,6 +5,7 @@ import android.app.Activity;
 import android.bluetooth.BluetoothClass;
 import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
@@ -37,6 +38,8 @@ import android.net.wifi.p2p.WifiP2pDevice;
 import android.net.wifi.p2p.WifiP2pDeviceList;
 import android.net.wifi.p2p.WifiP2pInfo;
 import android.net.wifi.p2p.WifiP2pManager;
+import com.thkoeln.jmoeller.vins_mobile_androidport.WiFiDirectBroadcastReceiver;
+
 import android.os.AsyncTask;
 import android.os.Build;
 import android.os.Environment;
@@ -300,9 +303,12 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
     // Nearby Connection API parameters
     final private Strategy P2P_STRATEGY = Strategy.P2P_CLUSTER;//P2P_CLUSTER
     private String SERVICE_ID;
-    //Map<String, String> mapIDName; //map unique android_id to nickname
-    //Map<String, Byte> mapNameByteID; // map nickname to one-byte ID
-    //List<String> connectedEndpointID;
+
+    // Wifi Direct
+    private final IntentFilter intentFilter = new IntentFilter();
+    private WifiP2pManager manager;
+    private WifiP2pManager.Channel channel;
+    protected com.thkoeln.jmoeller.vins_mobile_androidport.WifiDirectBroadcastReceiver receiver;
 
     private final ConnectionLifecycleCallback connectionLifecycleCallback =
             new ConnectionLifecycleCallback() {
@@ -861,10 +867,26 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
         SERVICE_ID = this.getPackageName();
         Log.i(TAG, String.format("SERVICE_ID: %s",SERVICE_ID));
         Log.i(TAG, String.format("displayWidth: %d displayHeight: %d",displayWidth,displayHeight));
-        startAdvertising();
-        startDiscovery();
+        //startAdvertising();
+        //startDiscovery();
     }
 
+    private void initWifiDirect(){
+        // Indicates a change in the Wi-Fi P2P status.
+        intentFilter.addAction(WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION);
+
+        // Indicates a change in the list of available peers.
+        intentFilter.addAction(WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION);
+
+        // Indicates the state of Wi-Fi P2P connectivity has changed.
+        intentFilter.addAction(WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION);
+
+        // Indicates this device's details have changed.
+        intentFilter.addAction(WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION);
+
+        manager = (WifiP2pManager) getSystemService(Context.WIFI_P2P_SERVICE);
+        channel = manager.initialize(this, getMainLooper(), null);
+    }
     // check whether this peer is already connected
     private boolean alreadyConnectedPeer(String eid){
         if (connectedPeers.size() <= 0){
@@ -1703,6 +1725,8 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
     }
     protected void onResume() {
         super.onResume();
+        receiver = new WiFiDirectBroadcastReceiver(manager,channel,this);
+        registerReceiver(receiver, intentFilter);
     }
     /**
      * shutting down onPause
@@ -1716,7 +1740,7 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
             imageReader.close();
             imageReader = null;
         }
-        
+        unregisterReceiver(receiver);
         VinsJNI.onPause();
         super.onPause();
     }
