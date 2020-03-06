@@ -1,0 +1,835 @@
+package com.thkoeln.jmoeller.vins_mobile_androidport.backup;
+// Android
+
+import android.app.Activity;
+import android.app.Fragment;
+import android.content.Context;
+import android.content.pm.PackageInfo;
+import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.ImageFormat;
+import android.graphics.SurfaceTexture;
+import android.hardware.Sensor;
+import android.hardware.SensorManager;
+import android.hardware.TriggerEvent;
+import android.hardware.TriggerEventListener;
+import android.hardware.camera2.CameraAccessException;
+import android.hardware.camera2.CameraCaptureSession;
+import android.hardware.camera2.CameraCharacteristics;
+import android.hardware.camera2.CameraDevice;
+import android.hardware.camera2.CameraManager;
+import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.params.StreamConfigurationMap;
+import android.media.Image;
+import android.media.ImageReader;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.HandlerThread;
+import android.support.annotation.NonNull;
+import android.support.v4.app.ActivityCompat;
+import android.support.v4.content.ContextCompat;
+import android.support.v7.app.AppCompatActivity;
+import android.util.Log;
+import android.util.Range;
+import android.util.Rational;
+import android.util.Size;
+import android.view.Display;
+import android.view.MotionEvent;
+import android.view.Surface;
+import android.view.SurfaceView;
+import android.view.TextureView;
+import android.view.WindowManager;
+import android.widget.CompoundButton;
+import android.widget.ImageView;
+import android.widget.SeekBar;
+import android.widget.Switch;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import com.thkoeln.jmoeller.vins_mobile_androidport.CameraConnectionFragment;
+import com.thkoeln.jmoeller.vins_mobile_androidport.DNNObjectDetection;
+import com.thkoeln.jmoeller.vins_mobile_androidport.OverlayView;
+import com.thkoeln.jmoeller.vins_mobile_androidport.R;
+import com.thkoeln.jmoeller.vins_mobile_androidport.VinsJNI;
+import com.thkoeln.jmoeller.vins_mobile_androidport.env.ImageUtils;
+
+import org.opencv.android.OpenCVLoader;
+import org.opencv.core.CvType;
+import org.opencv.core.Mat;
+import org.opencv.imgcodecs.Imgcodecs;
+import org.opencv.imgproc.Imgproc;
+import org.opencv.objdetect.CascadeClassifier;
+import org.opencv.objdetect.HOGDescriptor;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.List;
+
+// Java
+// OpenCV
+
+
+/**
+ * {@link MainActivityTestTFLite} only activity
+ * manages camera input, texture output
+ * textViews and buttons
+ */
+public class MainActivityTestTFLite extends AppCompatActivity implements ImageReader.OnImageAvailableListener {
+
+    private static boolean ARchoice = false; // false
+    private static final String TAG = "MainActivity";
+
+    static {
+        System.loadLibrary("opencv_java3");
+        if (OpenCVLoader.initDebug()){
+            Log.i(TAG, "OpenCV loaded successfully");
+        }
+    }
+
+
+    // needed for permission request callback
+    private static final int PERMISSIONS_REQUEST_CODE = 12345;
+
+    // camera2 API Camera
+    private CameraDevice camera;
+    // Back cam, 1 would be the front facing one
+    private String cameraID = "0";
+
+    // Texture View to display the camera picture, or the vins output
+    private TextureView textureView;
+    private Size previewSize;
+    private CaptureRequest.Builder previewBuilder;
+    private ImageReader imageReader;
+
+    // Handler for Camera Thread
+    private Handler handler;
+    private HandlerThread threadHandler;
+
+    // Cam parameters
+    private final int imageWidth = 640;
+    private final int imageHeight = 480;//xukan origin 480
+
+
+
+    int displayWidth;
+    int displayHeight;
+
+
+    private final int framesPerSecond = 30; //30
+    
+    /** Adjustment to auto-exposure (AE) target image brightness in EV */
+    private final int aeCompensation = 0;
+//    private final int aeCompensation = -1;
+    
+    private Surface surface;
+    
+    // JNI Object
+    private VinsJNI vinsJNI;
+
+    // TextViews
+    private TextView tvX;
+    private TextView tvY;
+    private TextView tvZ;
+    private TextView tvTotal;
+    private TextView tvLoop;
+    private TextView tvFeature;
+    private TextView tvBuf;
+    private OverlayView trackingOverlay;
+    
+    // ImageView for initialization instructions
+    private ImageView ivInit;
+    private SurfaceView surfaceView;
+    private Canvas surfaceCanvas;
+
+    // directory path for BRIEF config files
+    private final String directoryPathBriefFiles = "/storage/emulated/0/VINS";
+
+    // Distance of virtual Cam from Center
+    // could be easily manipulated in UI later
+    private float virtualCamDistance = 2;
+    private final float minVirtualCamDistance = 2;
+    private final float maxVirtualCamDistance = 40;
+
+    private static int countVINS;
+    private static long startActivityMs;
+
+    private SensorManager sensorManager;
+    private Sensor sensor;
+    private TriggerEventListener triggerEventListener;
+
+    private CascadeClassifier cascadeClassifier = null;
+    private HOGDescriptor hogDescriptor = null;
+    static final int kMaxChannelValue = 262143;
+    private byte[][] yuvBytes = new byte[3][];
+    private int[] rgbBytes = null;
+    private Runnable imageConverter;
+    private Runnable objectDetector; // using cascade classifier
+    private Runnable drawingThread;
+    private boolean detecting_objects = false;
+    private boolean drawing_detections = false;
+    private Bitmap rgbFrameBitmap = null;
+    private Bitmap drawBitmap = null;
+    private boolean updatedDrawBitmap = false;
+    private Mat rgbFrameMat = new Mat(imageHeight,imageWidth, CvType.CV_8UC4);
+
+    private DNNObjectDetection detector;
+    private int timestamp = 0;
+    private Activity appActivity;
+    private boolean useCamera2API;
+    /**
+     * Gets Called after App start
+     */
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.camera_connection_fragment_tracking);
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+
+        // first make sure the necessary permissions are given
+        checkPermissionsIfNeccessary();
+        
+        if(!checkBriefFileExistance()) {
+            Log.e(TAG, "Brief files not found here: " + directoryPathBriefFiles);
+            finish();
+        }
+        Display d = ((WindowManager)getSystemService(Context.WINDOW_SERVICE)).getDefaultDisplay();
+        displayWidth = d.getWidth();
+        displayHeight = d.getHeight();
+        initLooper();
+        initVINS();
+        initViews();
+        countVINS = 0;
+        startActivityMs = System.currentTimeMillis();
+        initializeOpenCVDependencies();
+        rgbFrameBitmap = Bitmap.createBitmap(imageWidth,imageHeight, Bitmap.Config.ARGB_8888);
+        drawBitmap = Bitmap.createBitmap(imageWidth,imageHeight, Bitmap.Config.ARGB_8888);
+        //MovementDetector.getInstance(this);
+        initSensor();
+        final Context appContext = getApplicationContext();
+        detector = new DNNObjectDetection(appContext);
+        appActivity = (Activity) this;
+        detector.init(appActivity, imageWidth,imageHeight);
+    }
+
+    
+    private void initSensor(){
+        sensorManager = (SensorManager) getSystemService(Context.SENSOR_SERVICE);
+        sensor = sensorManager.getDefaultSensor(Sensor.TYPE_SIGNIFICANT_MOTION);
+
+        triggerEventListener = new TriggerEventListener() {
+            @Override
+            public void onTrigger(TriggerEvent event) {
+                Log.i(TAG, "Significant motion detected!!!");
+            }
+        };
+
+        sensorManager.requestTriggerSensor(triggerEventListener, sensor);
+    }
+    private void initializeOpenCVDependencies() {
+
+        try {
+            // Copy the resource into a temp file so OpenCV can load it
+            InputStream is = getResources().openRawResource(R.raw.haarcascade_fullbody);
+            File cascadeDir = getDir("cascade", Context.MODE_PRIVATE);
+            // clear data cache in app folder "cascade"
+            if (cascadeDir.isDirectory()){
+                String[] children = cascadeDir.list();
+                for (String c : children){
+                    new File(cascadeDir, c).delete();
+                }
+            }
+            Log.i(TAG, "cascadeDir: "+cascadeDir.getAbsolutePath());
+            File mCascadeFile = new File(cascadeDir, "cascade.xml");
+            Log.i(TAG, String.format("cascadeDir mCascadeFile: %s size: %d",mCascadeFile.getAbsolutePath(),mCascadeFile.length()));
+            FileOutputStream os = new FileOutputStream(mCascadeFile);
+
+            byte[] buffer = new byte[4096];
+            int bytesRead;
+            while ((bytesRead = is.read(buffer)) != -1) {
+                os.write(buffer,0,bytesRead);
+            }
+            is.close();
+            os.close();
+            Log.i(TAG, String.format("cascadeDir mCascadeFile: %s size: %d",mCascadeFile.getAbsolutePath(),mCascadeFile.length()));
+            // Load the cascade classifier
+            cascadeClassifier = new CascadeClassifier(mCascadeFile.getAbsolutePath());
+            //cascadeClassifier.load(mCascadeFile.getAbsolutePath());
+
+        } catch (Exception e) {
+            Log.e("OpenCVActivity", "Error loading cascade", e);
+        }
+        if (cascadeClassifier != null){
+            Log.i(TAG, "cascadeClassifier not null");
+        }
+
+        hogDescriptor = new HOGDescriptor();
+        hogDescriptor.setSVMDetector(HOGDescriptor.getDefaultPeopleDetector());
+
+        if (rgbBytes == null){
+            rgbBytes = new int[imageWidth * imageHeight];
+        }
+    }
+    /**
+     * check if necessary files brief_k10L6.bin and brief_pattern.yml exist in the directoryPathBriefFiles
+     * @return true if files are existent and read and writable
+     */
+    private boolean checkBriefFileExistance() {
+        File directoryFile = new File(directoryPathBriefFiles);
+        if(!directoryFile.exists())
+            return false;
+
+        String filepathVoc = directoryFile + File.separator + "brief_k10L6.bin";
+        File vocFile = new File(filepathVoc);
+        Log.d(TAG, "Filepath: " + filepathVoc + 
+                   " File Exists: " + vocFile.exists() + 
+                   " File Write: " + vocFile.canWrite() +  
+                   " File Read: " + vocFile.canRead());
+        if(!vocFile.exists() || !vocFile.canRead() || !vocFile.canWrite())
+            return false;
+        
+        String filepathPattern = directoryFile + File.separator + "brief_pattern.yml";
+        File patternFile = new File(filepathPattern);
+        Log.d(TAG, "Filepath: " + filepathPattern + 
+                   " File Exists: " + patternFile.exists() + 
+                   " File Write: " + patternFile.canWrite() +  
+                   " File Read: " + patternFile.canRead());
+        if(!patternFile.exists() || !patternFile.canRead() || !patternFile.canWrite())
+            return false;
+        
+        return true;
+    }
+
+    /**
+     * Starting separate thread to handle camera input
+     */
+    private void initLooper() {
+        threadHandler = new HandlerThread("Camera2Thread");
+        threadHandler.start();
+        handler = new Handler(threadHandler.getLooper());
+    }
+
+    /**
+     * initializes an new VinsJNI Object
+     */
+    private void initVINS() {
+        vinsJNI = new VinsJNI();
+        vinsJNI.init();
+    }
+    
+    /**
+     * Finding all UI Elements,
+     * Setting TextureView Listener to this object.
+     */
+    private void initViews() {
+        tvX = (TextView) findViewById(R.id.x_Label);
+        tvY = (TextView) findViewById(R.id.y_Label);
+        tvZ = (TextView) findViewById(R.id.z_Label);
+        tvTotal = (TextView) findViewById(R.id.total_odom_Label);
+        tvLoop = (TextView) findViewById(R.id.loop_Label);
+        tvFeature = (TextView) findViewById(R.id.feature_Label);
+        tvBuf = (TextView) findViewById(R.id.buf_Label);
+
+        trackingOverlay  = (OverlayView) findViewById(R.id.tracking_overlay);
+
+        trackingOverlay.addCallback(new OverlayView.DrawCallback() {
+            @Override
+            public void drawCallback(Canvas canvas) {
+                detector.draw(canvas);
+            }
+        });
+
+        // Define the Switch listeners
+        Switch arSwitch = (Switch) findViewById(R.id.ar_switch);
+        arSwitch.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
+            @Override
+            public void onCheckedChanged(CompoundButton buttonView, boolean isChecked) {
+                Log.d(TAG,"arSwitch State = " + isChecked);
+                ARchoice = isChecked;
+                VinsJNI.onARSwitch(isChecked);
+            }
+        });
+        
+        Switch loopSwitch = (Switch) findViewById(R.id.loop_switch);
+        loopSwitch.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
+            @Override
+            public void onCheckedChanged(CompoundButton buttonView, boolean isChecked) {
+                Log.d(TAG,"loopSwitch State = " + isChecked);
+                VinsJNI.onLoopSwitch(isChecked);
+            }
+        });
+
+        SeekBar zoomSlider = (SeekBar) findViewById(R.id.zoom_slider);
+        zoomSlider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                virtualCamDistance = minVirtualCamDistance + ((float)progress / 100) * (maxVirtualCamDistance - minVirtualCamDistance);
+                Log.i(TAG,String.format("virtualCamDistance: %.2f", virtualCamDistance));
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar seekBar) {  }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar seekBar) {  }
+        });
+    }
+
+
+    private CameraDevice.StateCallback cameraDeviceStateCallback = new CameraDevice.StateCallback() {
+
+        @Override
+        public void onOpened(CameraDevice cameraDevice) {
+            try {
+                camera = cameraDevice;
+                startCameraView(camera);
+            } catch (CameraAccessException e) {
+                e.printStackTrace();
+            }
+        }
+
+        @Override
+        public void onDisconnected(CameraDevice camera) {}
+
+        @Override
+        public void onError(CameraDevice camera, int error) {}
+    };
+
+    /**
+     * starts CameraView
+     */
+    private void startCameraView(CameraDevice camera) throws CameraAccessException {
+        SurfaceTexture texture = textureView.getSurfaceTexture();
+        
+        // to set CameraView size
+        texture.setDefaultBufferSize(textureView.getWidth(), textureView.getHeight());
+        Log.d(TAG, "texture width: " + textureView.getWidth() + " height: " + textureView.getHeight());
+        surface = new Surface(texture);
+                
+        try {
+            // to set request for CameraView
+            previewBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+        } catch (CameraAccessException e) {
+            e.printStackTrace();
+        }
+
+
+
+        CameraManager cameraManager = (CameraManager) getSystemService(Context.CAMERA_SERVICE);
+        CameraCharacteristics characteristics = cameraManager.getCameraCharacteristics(cameraID);
+        // get the StepSize of the auto exposure compensation
+        Rational aeCompStepSize = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP);
+
+
+        if(aeCompStepSize == null) {
+            Log.e(TAG, "Camera doesn't support setting Auto-Exposure Compensation");
+            finish();
+        }
+        Log.d(TAG, "AE Compensation StepSize: " + aeCompStepSize);
+        
+        int aeCompensationInSteps = aeCompensation * aeCompStepSize.getDenominator() / aeCompStepSize.getNumerator();
+        Log.d(TAG, "aeCompensationInSteps: " + aeCompensationInSteps );
+        previewBuilder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, aeCompensationInSteps);
+        
+        // set the camera output frequency to 30Hz
+        previewBuilder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, new Range<Integer>(framesPerSecond, framesPerSecond));
+
+        // the first added target surface is for CameraView display
+        // the second added target mImageReader.getSurface() 
+        // is for ImageReader Callback where it can be access EACH frame
+        //mPreviewBuilder.addTarget(surface);
+        previewBuilder.addTarget(imageReader.getSurface());
+
+        //output Surface
+        List<Surface> outputSurfaces = new ArrayList<>();
+        outputSurfaces.add(imageReader.getSurface());
+        
+        
+        camera.createCaptureSession(outputSurfaces, sessionStateCallback, handler);
+    }
+
+    private CameraCaptureSession.StateCallback sessionStateCallback = new CameraCaptureSession.StateCallback() {
+        @Override
+        public void onConfigured(CameraCaptureSession session) {
+            try {
+                updateCameraView(session);
+            } catch (CameraAccessException e) {
+                e.printStackTrace();
+            }
+        }
+
+        @Override
+        public void onConfigureFailed(CameraCaptureSession session) {
+
+        }
+    };
+    /**
+     * Starts the RepeatingRequest for 
+     */
+    protected void fillBytes(final Image.Plane[] planes, final byte[][] yuvBytes) {
+        // Because of the variable row stride it's not possible to know in
+        // advance the actual necessary dimensions of the yuv planes.
+        for (int i = 0; i < planes.length; ++i) {
+            final ByteBuffer buffer = planes[i].getBuffer();
+            if (yuvBytes[i] == null) {
+                Log.d(TAG,String.format("Initializing buffer %d at size %d", i, buffer.capacity()));
+                yuvBytes[i] = new byte[buffer.capacity()];
+            }
+            buffer.get(yuvBytes[i]);
+        }
+    }
+
+
+    private void updateCameraView(CameraCaptureSession session)
+            throws CameraAccessException {
+//        previewBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO);
+        previewBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO);
+
+        session.setRepeatingRequest(previewBuilder.build(), null, handler);
+    }
+    
+    /**
+     *  At last the actual function with access to the image
+     */
+
+        public void onImageAvailable(ImageReader reader) {
+            // get the newest frame
+            Image image = reader.acquireNextImage();
+            
+            if (image == null) {
+                return;
+            }
+                    
+            if (image.getFormat() != ImageFormat.YUV_420_888) {
+                Log.e(TAG, "xukan, camera image is in wrong format");
+            }else{
+                Log.i(TAG, "xukan, camera image is in right format");
+            }
+            ++timestamp;
+            final long currTimestamp = timestamp;
+            //RGBA output
+            Image.Plane Y_plane = image.getPlanes()[0];
+            final int Y_rowStride = Y_plane.getRowStride();
+            Image.Plane U_plane = image.getPlanes()[1];
+            final int UV_rowStride = U_plane.getRowStride();
+            final int UV_pixelStride = U_plane.getPixelStride();
+            Image.Plane V_plane = image.getPlanes()[2];
+
+
+            int currentRotation = getWindowManager().getDefaultDisplay().getRotation();
+            boolean isScreenRotated = currentRotation != Surface.ROTATION_90;
+
+            // pass image to c++ part
+            countVINS++;
+            float vinsFPS =  ( (float)countVINS /(float)(System.currentTimeMillis()-startActivityMs)) * 1000.0f;
+            Log.i(TAG,String.format("VINS frame rate: %.2f", vinsFPS));
+            Log.i(TAG,"Before VinsJNI.onImageAvailable");
+            /*
+            VinsJNI.onImageAvailable(image.getWidth(), image.getHeight(),
+                    Y_rowStride, Y_plane.getBuffer(),
+                    UV_rowStride, U_plane.getBuffer(), V_plane.getBuffer(),
+                    surface, image.getTimestamp(), isScreenRotated,
+                    virtualCamDistance);
+
+            // run the updateViewInfo function on the UI Thread so it has permission to modify it
+            runOnUiThread(new Runnable() {
+                public void run() {
+                    VinsJNI.updateViewInfo(tvX, tvY, tvZ, tvTotal, tvLoop, tvFeature, tvBuf, ivInit);
+                }
+            });*/
+
+            fillBytes(image.getPlanes(),yuvBytes);
+            image.close();
+            ImageUtils.convertYUV420ToARGB8888(
+                    yuvBytes[0],
+                    yuvBytes[1],
+                    yuvBytes[2],
+                    imageWidth,
+                    imageHeight,
+                    Y_rowStride,
+                    UV_rowStride,
+                    UV_pixelStride,
+                    rgbBytes
+            );
+
+            rgbFrameBitmap.setPixels(rgbBytes,0,imageWidth,0,0,imageWidth,imageHeight);
+
+            detector.onFrame(
+                    imageWidth,
+                    imageHeight,
+                    Y_rowStride,
+                    appActivity,
+                    yuvBytes[0],
+                    timestamp
+            );
+
+            int dnn_detection_period = 30;
+            if (countVINS % dnn_detection_period == 0) {
+                detector.detect(rgbFrameBitmap, currTimestamp);
+            }
+
+        }
+
+    private void saveMatToExternal(Mat mat, int id){
+        Imgproc.cvtColor(mat,mat,Imgproc.COLOR_RGB2BGR);
+        String filename =  String.format("%010d.jpg",id);
+        String fileFullPath = directoryPathBriefFiles + File.separator
+                + "saved_images" + File.separator + filename;
+        Imgcodecs.imwrite(fileFullPath,mat);
+    }
+
+    private boolean isHardwareLevelSupported(
+            CameraCharacteristics characteristics, int requiredLevel) {
+        int deviceLevel = characteristics.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL);
+        if (deviceLevel == CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_LEGACY) {
+            return requiredLevel == deviceLevel;
+        }
+        // deviceLevel is not LEGACY, can use numerical sort
+        return requiredLevel <= deviceLevel;
+    }
+
+    private String chooseCamera() {
+        final CameraManager manager = (CameraManager) getSystemService(Context.CAMERA_SERVICE);
+        try {
+            for (final String cameraId : manager.getCameraIdList()) {
+                final CameraCharacteristics characteristics = manager.getCameraCharacteristics(cameraId);
+
+                // We don't use a front facing camera in this sample.
+                final Integer facing = characteristics.get(CameraCharacteristics.LENS_FACING);
+                if (facing != null && facing == CameraCharacteristics.LENS_FACING_FRONT) {
+                    continue;
+                }
+
+                final StreamConfigurationMap map =
+                        characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+
+                if (map == null) {
+                    continue;
+                }
+
+                // Fallback to camera1 API for internal cameras that don't have full support.
+                // This should help with legacy situations where using the camera2 API causes
+                // distorted or otherwise broken previews.
+                useCamera2API = (facing == CameraCharacteristics.LENS_FACING_EXTERNAL)
+                        || isHardwareLevelSupported(characteristics,
+                        CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_FULL);
+                Log.i(TAG,String.format("Camera API lv2?: %b", useCamera2API));
+                return cameraId;
+            }
+        } catch (CameraAccessException e) {
+            Log.e(TAG, "Not allowed to access camera");
+        }
+
+        return null;
+    }
+
+    protected void setFragment() {
+        String cameraId = chooseCamera();
+        if (cameraId == null) {
+            Toast.makeText(this, "No Camera Detected", Toast.LENGTH_SHORT).show();
+            finish();
+        }
+
+        if (!useCamera2API){
+            Log.e(TAG, "Camera2API not supported");
+        }
+        Fragment fragment;
+
+
+            CameraConnectionFragment camera2Fragment =
+                    CameraConnectionFragment.newInstance(
+                            new CameraConnectionFragment.ConnectionCallback() {
+                                @Override
+                                public void onPreviewSizeChosen(final Size size, final int rotation) {
+                                    //previewHeight = size.getHeight();
+                                    //previewWidth = size.getWidth();
+                                    //MainActivityTestTFLite.this.onPreviewSizeChosen(size, rotation);
+                                }
+                            },
+                            this,
+                            getLayoutId(),
+                            getDesiredPreviewFrameSize());
+
+            camera2Fragment.setCamera(cameraId);
+            fragment = camera2Fragment;
+
+
+        getFragmentManager()
+                .beginTransaction()
+                .replace(R.id.container, fragment)
+                .commit();
+    }
+
+    protected int getLayoutId() {
+        return R.layout.camera_connection_fragment_tracking;
+    }
+
+    protected Size getDesiredPreviewFrameSize() {
+        return new Size(imageWidth,imageHeight);
+    }
+    private void objectDetector(){
+        /*
+            Utils.bitmapToMat(rgbFrameBitmap,rgbFrameMat);
+
+            objectDetector = new Runnable() {
+                @Override
+                public void run() {
+                    detecting_objects = true;
+                    Process.setThreadPriority(Process.THREAD_PRIORITY_LOWEST);
+                    if (cascadeClassifier == null || hogDescriptor == null) return;
+                    Mat greyFrameMat = new Mat();
+                    Imgproc.cvtColor(rgbFrameMat,greyFrameMat,Imgproc.COLOR_RGB2GRAY);
+                    Imgproc.equalizeHist(greyFrameMat,greyFrameMat);
+                    Mat lap = new Mat();
+                    Imgproc.Laplacian(greyFrameMat,lap,3);
+                    MatOfDouble median = new MatOfDouble();
+                    MatOfDouble std = new MatOfDouble();
+                    Core.meanStdDev(lap, median, std);
+                    double varOfLap = Math.pow(std.get(0,0)[0],2);
+                    Log.i(TAG, String.format("Variance of Laplace: %.4f",varOfLap));
+                    Log.i(TAG, String.format("countVINS %010d",countVINS));
+                    if (varOfLap > 1000.0){ // Variance of Laplace sharpness threshold
+                        MatOfRect locationsCascade = new MatOfRect();
+                        MatOfRect locationsHOG = new MatOfRect();
+                        MatOfDouble weights = new MatOfDouble(); //for hog
+                        cascadeClassifier.detectMultiScale(greyFrameMat,locationsCascade);
+                        Mat bgrFrameMat = new Mat();
+                        Imgproc.cvtColor(rgbFrameMat,bgrFrameMat, Imgproc.COLOR_RGB2BGR);
+                        hogDescriptor.detectMultiScale(bgrFrameMat,locationsHOG,weights);
+                        Log.i(TAG, String.format("Locations Cascade: %d HOG: %d ",
+                                locationsCascade.toList().size(),locationsHOG.toList().size()));
+                        List<Rect> locationsListCascade = locationsCascade.toList();
+                        for (Rect rect : locationsListCascade) {
+                            Imgproc.rectangle(bgrFrameMat,
+                                    new Point(rect.x,rect.y),
+                                    new Point(rect.x + rect.width , rect.y + rect.height),
+                                    new Scalar(255,0,0),
+                                    5);
+                        }
+                        List<Rect> locationsListHog = locationsHOG.toList();
+                        for (Rect rect : locationsListHog) {
+                            Imgproc.rectangle(bgrFrameMat,
+                                    new Point(rect.x,rect.y),
+                                    new Point(rect.x + rect.width , rect.y + rect.height),
+                                    new Scalar(0,0,255),
+                                    5);
+                        }
+                        Mat rgbFrameMatToDraw = new Mat();
+                        Imgproc.cvtColor(bgrFrameMat,rgbFrameMatToDraw,Imgproc.COLOR_BGR2RGB);
+                        Utils.matToBitmap(rgbFrameMatToDraw,drawBitmap);
+                        updatedDrawBitmap = true;
+                        //saveMatToExternal(rgbFrameMatToDraw,countVINS);
+
+                    }
+                    detecting_objects = false;
+                }
+            };
+
+            final int OBJ_DET_PERIOD = 5; // detect objects every ... frame
+            if (!detecting_objects && countVINS % OBJ_DET_PERIOD == 0) {
+                objectDetector.run();
+            }
+            drawingThread = new Runnable() {
+                @Override
+                public void run() {
+                    updatedDrawBitmap = false;
+                    ivInit.setImageBitmap(drawBitmap);
+                    drawing_detections = false;
+                }
+            };
+
+            if (drawBitmap != null &&
+                    !drawing_detections &&
+                        updatedDrawBitmap == true){
+                drawing_detections = true;
+                runOnUiThread(drawingThread);
+            }*/
+        // pass the current device's screen orientation to the c++ part
+        // save frames to external
+        //saveMatToExternal(rgbFrameMat, countVINS);
+    }
+    /**
+     * shutting down onPause
+     */
+    protected void onPause() {
+        if (null != camera) {
+            camera.close();
+            camera = null;
+        }
+        if (null != imageReader) {
+            imageReader.close();
+            imageReader = null;
+        }
+        
+        VinsJNI.onPause();
+        
+        super.onPause();
+    }
+
+    /**
+     * @return true if permissions where given
+     */
+    private boolean checkPermissionsIfNeccessary() {
+        try {
+            PackageInfo info = getPackageManager().getPackageInfo(this.getPackageName(), PackageManager.GET_PERMISSIONS);
+            if (info.requestedPermissions != null) {
+                List<String> permissionsNotGrantedYet = new ArrayList<>(info.requestedPermissions.length);
+                for (String p : info.requestedPermissions) {
+                    if (ContextCompat.checkSelfPermission(this, p) != PackageManager.PERMISSION_GRANTED) {
+                        permissionsNotGrantedYet.add(p);
+                    }
+                }
+                if(permissionsNotGrantedYet.size() > 0){
+                    ActivityCompat.requestPermissions(this, permissionsNotGrantedYet.toArray(new String[permissionsNotGrantedYet.size()]),
+                                                      PERMISSIONS_REQUEST_CODE);
+                    return false;
+                }
+            }
+        } catch (PackageManager.NameNotFoundException e) {
+            e.printStackTrace();
+        }
+
+        return true;
+    }
+    
+    @Override
+    public void onRequestPermissionsResult(int requestCode,
+                                           @NonNull String permissions[],
+                                           @NonNull int[] grantResults) {
+
+        if(requestCode == PERMISSIONS_REQUEST_CODE) {
+            boolean hasAllPermissions = true;
+            // If request is cancelled, the result arrays are empty.
+            if (grantResults.length == 0)
+                hasAllPermissions = false;
+            for (int result : grantResults) {
+                if (result != PackageManager.PERMISSION_GRANTED)
+                    hasAllPermissions = false;
+            }
+
+            if(!hasAllPermissions){
+                finish();
+            }
+        }
+    }
+
+    @Override
+    public boolean onTouchEvent(MotionEvent e) {
+        // MotionEvent reports input details from the touch screen
+        // and other input controls. In this case, you are only
+        // interested in events where the touch position changed.
+        if(ARchoice) {
+            float x = e.getX();
+            float y = e.getY();
+            Log.d("Xukan disply", "displayHeight: " + displayHeight + "; displayWidth: " + displayWidth);
+            float yratio = y / displayHeight * imageWidth;//*640
+            float xratio = x / displayWidth * imageHeight;//* 480
+            VinsJNI.setARTouchPosition(xratio, yratio);
+        }
+        return true;
+    }
+
+}
