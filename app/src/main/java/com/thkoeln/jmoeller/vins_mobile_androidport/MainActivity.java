@@ -33,18 +33,19 @@ import android.net.Network;
 import android.net.NetworkInfo;
 import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
+import android.net.wifi.WpsInfo;
 import android.net.wifi.p2p.WifiP2pConfig;
 import android.net.wifi.p2p.WifiP2pDevice;
 import android.net.wifi.p2p.WifiP2pDeviceList;
 import android.net.wifi.p2p.WifiP2pInfo;
 import android.net.wifi.p2p.WifiP2pManager;
-import com.thkoeln.jmoeller.vins_mobile_androidport.WiFiDirectBroadcastReceiver;
 
 import android.os.AsyncTask;
 import android.os.Build;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.os.ParcelFileDescriptor;
 import android.os.Process;
 import android.os.SystemClock;
 import androidx.annotation.NonNull;
@@ -86,10 +87,12 @@ import java.io.ObjectOutput;
 import java.io.ObjectOutputStream;
 import java.io.OutputStream;
 import java.io.Serializable;
+import java.net.InetAddress;
 import java.net.NetworkInterface;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -257,13 +260,18 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
     private boolean DO_DNN = false;
 
     private boolean sent_frame = false;
+
+    private boolean isWifiDirectConnected = false;
+    private boolean isWifiDirectGroupOwner = false;
+
     private class Device{
         String name;
         Byte byteID;
         String uniqueID;
         String macAddress;
         String phoneModel;
-        String endpointID; // for nearby connection id
+        String endpointID; // for nearby connection id to be removed
+        WifiP2pDevice wifiP2pDevice;
         private Device(String nme, int bid, String uid, String mac, String mod){
             this.name = nme;
             this.byteID = (byte) bid;
@@ -280,36 +288,212 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
             if (d.endpointID != null){
                 this.endpointID = d.endpointID;
             }
+            if (d.wifiP2pDevice != null){
+                this.wifiP2pDevice = d.wifiP2pDevice;
+            }
         }
         private void setEndpointID(String id){
             this.endpointID = id;
         }
+
         private String getEndpointID(){
             return this.endpointID;
         }
+
+        private void setWifiP2pDevice(WifiP2pDevice d){
+            this.wifiP2pDevice = d;
+        }
+
+        private WifiP2pDevice getWifiP2pDevice(){
+            return this.wifiP2pDevice;
+        }
+
+        private boolean equals (Device d){
+            return (this.name.equals(d.name) &&
+                    this.byteID.equals(d.byteID) &&
+                    this.uniqueID.equals(d.uniqueID)&&
+                    this.macAddress.equals(d.macAddress)&&
+                    this.phoneModel.equals(d.phoneModel)&&
+                    this.wifiP2pDevice.equals(d.wifiP2pDevice));
+        }
+
         @Override
         public String toString(){
             StringBuilder sb = new StringBuilder();
             sb.append("name: "+name).append(" byteID: "+byteID)
                     .append(" uniqueID: "+uniqueID).append(" macAddress: "+macAddress)
-                    .append(" phoneModel: "+phoneModel).append(" endpointID: "+endpointID);
+                    .append(" phoneModel: "+phoneModel);
+            if (endpointID != null) sb.append(" endpointID: "+endpointID);
+            if (wifiP2pDevice != null) sb.append(" WifiP2pDevice: "+wifiP2pDevice.toString());
             return sb.toString();
         }
     }
     Device thisDevice;
     List<Device> knownPeers;
-    List<Device> connectedPeers;
-    Set<String> connectedEPID;
+    //List<Device> toConnectPeers = new ArrayList<>(); // list of device to connect to wifidirect peers
+    List<Device> connectedWifiPeers = new ArrayList<>() ;
+    Device recentPeer;
+    List<Device> connectedPeers; // Nearby
+    Set<String> connectedEPID; // Nearby
     // Nearby Connection API parameters
     final private Strategy P2P_STRATEGY = Strategy.P2P_CLUSTER;//P2P_CLUSTER
     private String SERVICE_ID;
 
     // Wifi Direct
     private final IntentFilter intentFilter = new IntentFilter();
-    private WifiP2pManager manager;
-    private WifiP2pManager.Channel channel;
-    protected com.thkoeln.jmoeller.vins_mobile_androidport.WifiDirectBroadcastReceiver receiver;
+    private WifiP2pManager mManager;
+    private WifiP2pManager.Channel mChannel;
+    private WifiDirectBroadcastReceiver mReceiver;
 
+    private InputStream yStream;
+
+    private List<WifiP2pDevice> peers = new ArrayList<WifiP2pDevice>();
+
+    private WifiP2pManager.ConnectionInfoListener mConnectionInfoListener =
+            new WifiP2pManager.ConnectionInfoListener() {
+                @Override
+                public void onConnectionInfoAvailable(WifiP2pInfo info) {
+                    InetAddress groupOwnerAddress = info.groupOwnerAddress;
+                    Log.i(TAG, String.format("WifiDirect: group owner address %s",groupOwnerAddress.getHostAddress()));
+                    if (info.groupFormed && info.isGroupOwner) {
+                        // Do whatever tasks are specific to the group owner.
+                        // One common case is creating a group owner thread and accepting
+                        // incoming connections.
+                        Log.i(TAG, "WifiDirect: this is group owner");
+                        isWifiDirectGroupOwner = true;
+                    } else if (info.groupFormed) {
+                        // The other device acts as the peer (client). In this case,
+                        // you'll want to create a peer thread that connects
+                        // to the group owner.
+                        Log.i(TAG, "WifiDirect: this is group client");
+                        isWifiDirectGroupOwner = false;
+                    }
+                }
+            };
+
+    public void connect( List<Device> devices) {
+        if (devices.size() == 0 || mManager == null || mChannel == null){
+            return;
+        }
+        // Picking the first device found on the network.
+        for (final Device d: devices) {
+            WifiP2pDevice device = d.wifiP2pDevice;
+
+            WifiP2pConfig config = new WifiP2pConfig();
+            config.deviceAddress = device.deviceAddress;
+            config.wps.setup = WpsInfo.PBC;
+            if (d.name == "red"){
+                config.groupOwnerIntent = 10;
+            } else {
+                config.groupOwnerIntent = 1;
+            }
+            mManager.connect(mChannel, config, new WifiP2pManager.ActionListener() {
+
+                @Override
+                public void onSuccess() {
+                    // WiFiDirectBroadcastReceiver notifies us. Ignore for now.
+                    Log.d(TAG, "WifiDirect: mManager.connect onSuccess");
+                    recentPeer = d;
+                    //connectedWifiPeers.add(d);
+                }
+
+                @Override
+                public void onFailure(int reason) {
+                    Log.d(TAG, String.format("WifiDirect: mManager.connect onFailure %d",reason));
+                    recentPeer = null;
+                }
+            });
+        }
+    }
+
+    private WifiP2pManager.PeerListListener peerListListener = new WifiP2pManager.PeerListListener() {
+        @Override
+        public void onPeersAvailable(WifiP2pDeviceList peerList) {
+            List<WifiP2pDevice> refreshedPeers = new ArrayList(peerList.getDeviceList());
+
+            if (!refreshedPeers.equals(peers)) {
+                peers.clear();
+                peers.addAll(refreshedPeers);
+            }
+
+            if (peers.size() == 0) {
+                Log.d(TAG, "WifiDirect: No devices found");
+                return;
+            }
+
+            List<Device> toConnectPeers = new ArrayList<>();
+            for (WifiP2pDevice d: peers){
+                //Log.i(TAG, String.format("WifiDirect: peer %s",d.toString()));
+                for (Device k : knownPeers){
+                    if (k.macAddress.equals(d.deviceAddress)){
+                        Log.i(TAG, String.format("WifiDirect: found known peer %s",k.toString()));
+                        Device toConnect = new Device(k);
+                        toConnect.setWifiP2pDevice(d);
+                        toConnectPeers.add(toConnect);
+                    }
+                }
+            }
+            Log.i(TAG, String.format("WifiDirect: before toConnectPeers.size() %d connected peers %d",toConnectPeers.size(), connectedWifiPeers.size()));
+            // check new peer
+            //TODO: never pass this logic
+            if (connectedWifiPeers.size() > 0)  {
+                for (Device connected: connectedWifiPeers){
+                    for (Device toConnect: toConnectPeers){
+                        Log.d(TAG, String.format("WifiDirect: connected %s",connected.toString()));
+                        Log.d(TAG, String.format("WifiDirect: toConnect %s",toConnect.toString()));
+                        if (connected.equals(toConnect)){
+                            toConnectPeers.remove(toConnect);
+                        }
+                    }
+                }
+            }
+            Log.i(TAG, String.format("WifiDirect: after toConnectPeers.size() %d connected peers %d",toConnectPeers.size(), connectedWifiPeers.size()));
+            if (toConnectPeers.size() > 0) {
+                connect(toConnectPeers);
+            }
+        }
+    };
+
+    public class WifiDirectBroadcastReceiver extends BroadcastReceiver {
+
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            String action = intent.getAction();
+            if (WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION.equals(action)) {
+                int state = intent.getIntExtra(WifiP2pManager.EXTRA_WIFI_STATE, -1);
+                if (state == WifiP2pManager.WIFI_P2P_STATE_ENABLED) {
+                    Log.d(TAG, "WifiDirect: wifi p2p state enabled");
+                } else {
+                    Log.d(TAG, "WifiDirect: wifi p2p state disabled");
+                }
+            } else if (WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION.equals(action)) {
+                Log.d(TAG, "WifiDirect: WIFI_P2P_PEERS_CHANGED_ACTION");
+                if (mManager != null) {
+                    mManager.requestPeers(mChannel, peerListListener);
+                }
+                Log.d(TAG, "WifiDirect: WIFI_P2P_PEERS_CHANGED_ACTION peer changed");
+            } else if (WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION.equals(action)) {
+                if (mManager == null) {
+                    return;
+                }
+                NetworkInfo networkInfo = intent.getParcelableExtra(WifiP2pManager.EXTRA_NETWORK_INFO);
+                //Log.d(TAG, String.format("WifiDirect: networkInfo %s",networkInfo.getExtraInfo()));
+                if (networkInfo.isConnected()) {
+                    mManager.requestConnectionInfo(mChannel, mConnectionInfoListener);
+                    isWifiDirectConnected = true;
+                    if (recentPeer != null){
+                        connectedWifiPeers.add(recentPeer);
+                    }
+                    Log.d(TAG, "WifiDirect: isConnected");
+                } else {
+                    isWifiDirectConnected = false;
+                    Log.d(TAG, "WifiDirect: not connected");
+                }
+            } else if (WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION.equals(action)) {
+
+            }
+        }
+    }
     private final ConnectionLifecycleCallback connectionLifecycleCallback =
             new ConnectionLifecycleCallback() {
                 @Override
@@ -446,6 +630,7 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
             Log.i(TAG, String.format("Nearby: onPayloadReceived %s payload.getId() %d", fromEndpoint, payload.getId()));
             incomingPayloads.put(payload.getId(), payload);
             Log.i(TAG, String.format("Nearby: onPayloadReceived incomingPayloads.size() %d", incomingPayloads.size()));
+
             if (payload.getType() != Payload.Type.BYTES){
                 Log.e(TAG, "Nearby: onPayloadReceived Error!!! payload is not bytes");
                 return;
@@ -530,6 +715,8 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
                     update.getStatus(),update.getPayloadId(),update.getBytesTransferred ()));
 
             if (update.getStatus() == PayloadTransferUpdate.Status.SUCCESS) {
+                //sent_frame = false;
+                Log.i(TAG, String.format("Nearby: finished sending frame at %d",System.currentTimeMillis()));
                 Log.i(TAG, String.format("Nearby: onPayloadTransferUpdate incomingPayloads.size() %d", incomingPayloads.size()));
                 Payload payload = incomingPayloads.get(update.getPayloadId());
                 if (payload == null || payload.getType() != Payload.Type.STREAM){
@@ -869,6 +1056,7 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
         Log.i(TAG, String.format("displayWidth: %d displayHeight: %d",displayWidth,displayHeight));
         //startAdvertising();
         //startDiscovery();
+        initWifiDirect();
     }
 
     private void initWifiDirect(){
@@ -883,9 +1071,34 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
 
         // Indicates this device's details have changed.
         intentFilter.addAction(WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION);
+        // reset wifi
+        WifiManager wManager = (WifiManager)this.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+        wManager.setWifiEnabled(false);
+        wManager.setWifiEnabled(true);
+        // Wifi p2p manager and channel
+        mManager = (WifiP2pManager) getSystemService(Context.WIFI_P2P_SERVICE);
+        mChannel = mManager.initialize(this, getMainLooper(), null);
 
-        manager = (WifiP2pManager) getSystemService(Context.WIFI_P2P_SERVICE);
-        channel = manager.initialize(this, getMainLooper(), null);
+        Log.i(TAG, "WifiDirect: init wifi direct done");
+
+        mManager.discoverPeers(mChannel, new WifiP2pManager.ActionListener() {
+
+            @Override
+            public void onSuccess() {
+                // Code for when the discovery initiation is successful goes here.
+                // No services have actually been discovered yet, so this method
+                // can often be left blank. Code for peer discovery goes in the
+                // onReceive method, detailed below.
+                Log.i(TAG, "WifiDirect: discoverPeers onSuccess");
+            }
+
+            @Override
+            public void onFailure(int reasonCode) {
+                // Code for when the discovery initiation fails goes here.
+                // Alert the user that something went wrong.
+                Log.i(TAG, String.format("WifiDirect: discoverPeers onFailure reasonCode %d", reasonCode));
+            }
+        });
     }
     // check whether this peer is already connected
     private boolean alreadyConnectedPeer(String eid){
@@ -970,10 +1183,12 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
     }
 
     private void stopAdvertising() {
+        Log.i(TAG,"Nearby: stopAdvertising");
         Nearby.getConnectionsClient(getApplicationContext()).stopAdvertising();
     }
 
     private void stopDiscovery() {
+        Log.i(TAG,"Nearby: stopDiscovery");
         Nearby.getConnectionsClient(getApplicationContext()).stopDiscovery();
     }
 
@@ -1038,23 +1253,36 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
         Payload streamPayload = Payload.fromStream(stream);
         Nearby.getConnectionsClient(getApplicationContext()).sendPayload(endpointID,streamPayload);
     }
+
     private void sendStream2AllPeers(InputStream stream){
         if (connectedPeers.size() <= 0){
             Log.i(TAG, "No peer to send");
             return;
         }
-
+        List<String> allPeersEID = new ArrayList<>();
+        for (Device dev : connectedPeers) {
+            allPeersEID.add(dev.endpointID);
+            Log.i(TAG, String.format("Sending stream to %s", dev.endpointID));
+        }
         Payload streamPayload = Payload.fromStream(stream);
+        Nearby.getConnectionsClient(getApplicationContext()).sendPayload(allPeersEID,streamPayload);
+    }
+
+    private void sendStream2AllPeers(ParcelFileDescriptor descriptor){
+        if (connectedPeers.size() <= 0){
+            Log.i(TAG, "No peer to send");
+            return;
+        }
 
         List<String> allPeersEID = new ArrayList<>();
         for (Device dev : connectedPeers) {
             allPeersEID.add(dev.endpointID);
             Log.i(TAG, String.format("Sending stream to %s", dev.endpointID));
         }
+
+        Payload streamPayload = Payload.fromStream(descriptor);
         Nearby.getConnectionsClient(getApplicationContext()).sendPayload(allPeersEID,streamPayload);
-
     }
-
 
     private void attemptConnections(){
         if (connectedPeers.size() == 0){
@@ -1064,6 +1292,27 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
             startDiscovery();
         }
     }
+
+    private ParcelFileDescriptor getFileDescriptor(byte[] fileData) throws IOException {
+        Log.d(TAG, "Nearby: Found " + fileData.length + " bytes of data");
+        ParcelFileDescriptor[] pipe = ParcelFileDescriptor.createPipe();
+
+        // Stream the file data to our ParcelFileDescriptor output stream
+        InputStream inputStream = new ByteArrayInputStream(fileData);
+        ParcelFileDescriptor.AutoCloseOutputStream outputStream = new ParcelFileDescriptor.AutoCloseOutputStream(pipe[1]);
+        int len;
+        while ((len = inputStream.read()) >= 0) {
+            outputStream.write(len);
+        }
+        inputStream.close();
+        outputStream.flush();
+        outputStream.close();
+
+        // Return the ParcelFileDescriptor input stream to the calling activity in order to read
+        // the file data.
+        return pipe[1];//pipe[0]
+    }
+
     private void initSensor(){
         sensorManager = (SensorManager) getSystemService(Context.SENSOR_SERVICE);
         sensor = sensorManager.getDefaultSensor(Sensor.TYPE_SIGNIFICANT_MOTION);
@@ -1475,12 +1724,12 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
 
             int currentRotation = getWindowManager().getDefaultDisplay().getRotation();
             boolean isScreenRotated = currentRotation != Surface.ROTATION_90;
-            Log.i(TAG, String.format("Screen rotated?: %b",isScreenRotated));
+            //Log.i(TAG, String.format("Screen rotated?: %b",isScreenRotated));
             // pass image to c++ part
             countVINS++;
             float vinsFPS =  ( (float)countVINS /(float)(System.currentTimeMillis()-startActivityMs)) * 1000.0f;
-            Log.i(TAG,String.format("VINS frame rate: %.2f", vinsFPS));
-            Log.i(TAG,"Before VinsJNI.onImageAvailable");
+            //Log.i(TAG,String.format("VINS frame rate: %.2f", vinsFPS));
+            //Log.i(TAG,"Before VinsJNI.onImageAvailable");
 
             if (DO_SLAM) {
                 // loop detection remote
@@ -1525,17 +1774,34 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
             int sendFramePeriod = 120;
             if (connectedPeers.size() > 0 &&
                     thisDevice.name == "green" &&
-                    countVINS % sendFramePeriod == 0 &&
+                    //countVINS % sendFramePeriod == 0 &&
                     !sent_frame) {
                 final long startMs = System.currentTimeMillis();
                 byte[] yBytes = new byte[(yuvBytes[0].length) + 2];
                 yBytes[0] = (byte) 3; // messageID
                 yBytes[1] = thisDevice.byteID;
                 System.arraycopy(yuvBytes[0], 0, yBytes, 2, yuvBytes[0].length);
-                Log.i(TAG, String.format("yBytes[0] %d length %d", yBytes[0], yBytes.length));
-                Log.i(TAG, String.format("ConnectionsClient.MAX_BYTES_DATA_SIZE %d", ConnectionsClient.MAX_BYTES_DATA_SIZE));
-                InputStream yStream = new ByteArrayInputStream(yBytes);
-                Log.i(TAG, String.format("Prepare frame to send %d ms",System.currentTimeMillis()-startMs));
+                Log.i(TAG, String.format("Nearby: yBytes[0] %d length %d", yBytes[0], yBytes.length));
+                Log.i(TAG, String.format("Nearby: ConnectionsClient.MAX_BYTES_DATA_SIZE %d", ConnectionsClient.MAX_BYTES_DATA_SIZE));
+                yStream = new ByteArrayInputStream(yBytes);
+                /*ParcelFileDescriptor pfdYBytes = null;
+                try {
+                    pfdYBytes = getFileDescriptor(yBytes);
+                } catch (IOException e){
+
+                }*/
+                /*
+                byte[] targetArray = null;
+                try {
+                    targetArray = new byte[yStream.available()];
+                    yStream.read(targetArray);
+                } catch (IOException e){
+
+                }
+                Log.i(TAG, String.format("Nearby: target array length %d", targetArray.length));
+
+                //Log.i(TAG, String.format("Prepare frame to send %d ms",System.currentTimeMillis()-startMs));
+                */
                 //stopDiscovery();
                 sent_frame = true;
                 /*
@@ -1548,11 +1814,19 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
                 }
                 sendByte2AllPeers(Arrays.copyOfRange(yBytes,first_index,yBytes.length));
                 */
-                sendStream2AllPeers(yStream);
-
-
+                Log.i(TAG, String.format("Nearby: start sending frame at %d",System.currentTimeMillis()));
+                if (yStream != null){
+                    sendStream2AllPeers(yStream);
+                }
                 /*try{
-                    yStream.close();
+                    Log.i(TAG, String.format("Nearby: yStream.available() %d", yStream.available()));
+                    while (yStream.available() > 0){
+                        Log.i(TAG, String.format("Nearby: yStream.available() %d", yStream.available()));
+                        sendStream2AllPeers(yStream);
+                    }
+                    if (yStream != null){
+                        yStream.close();
+                    }
                 } catch (IOException e){
 
                 }*/
@@ -1725,8 +1999,8 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
     }
     protected void onResume() {
         super.onResume();
-        receiver = new WiFiDirectBroadcastReceiver(manager,channel,this);
-        registerReceiver(receiver, intentFilter);
+        mReceiver = new WifiDirectBroadcastReceiver();
+        registerReceiver(mReceiver, intentFilter);
     }
     /**
      * shutting down onPause
@@ -1740,9 +2014,9 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
             imageReader.close();
             imageReader = null;
         }
-        unregisterReceiver(receiver);
         VinsJNI.onPause();
         super.onPause();
+        unregisterReceiver(mReceiver);
     }
 
     /**

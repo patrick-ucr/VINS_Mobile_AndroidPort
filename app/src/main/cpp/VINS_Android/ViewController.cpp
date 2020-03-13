@@ -1271,7 +1271,7 @@ int ViewController::process_imu_sensor_events(int fd, int events, void *data) {
 
 
         double timeStampGyro = timeStampToSec(gyroEvent.timestamp);
-        LOGI("IMU gyro event timeStamp: %lf", timeStampGyro);
+        //LOGI("IMU gyro event timeStamp: %lf", timeStampGyro);
         //The timestamp is the amount of time in seconds since the device booted.
         assert(timeStampGyro > 0);
 
@@ -1348,7 +1348,7 @@ int ViewController::process_imu_sensor_events(int fd, int events, void *data) {
             //printf("imu inte update %lf %lf %lf %lf\n", imu_msg->header, instance.gyro_buf[0].gyr.x(), imu_msg->gyr.x(), instance.gyro_buf[1].gyr.x());
         }
         else {
-            LOGE("imu error %lf %lf %lf\n", instance->gyro_buf[0].header, instance->cur_acc->header, instance->gyro_buf[1].header);
+            //LOGE("imu error %lf %lf %lf\n", instance->gyro_buf[0].header, instance->cur_acc->header, instance->gyro_buf[1].header);
             continue;
         }
         
