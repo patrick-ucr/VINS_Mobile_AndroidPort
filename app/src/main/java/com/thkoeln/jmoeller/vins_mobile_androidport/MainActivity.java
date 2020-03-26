@@ -77,6 +77,9 @@ import android.widget.TextView;
 // Java
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.DataInput;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.Externalizable;
 import java.io.File;
 import java.io.IOException;
@@ -88,8 +91,14 @@ import java.io.ObjectOutputStream;
 import java.io.OutputStream;
 import java.io.Serializable;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.NetworkInterface;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.SocketTimeoutException;
+import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
+import java.nio.channels.IllegalBlockingModeException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -263,6 +272,14 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
 
     private boolean isWifiDirectConnected = false;
     private boolean isWifiDirectGroupOwner = false;
+    private boolean startedSocketServer = false;
+    final private int SOCKET_PORT = 9876;
+
+    private ServerSocket server;
+
+    final private Handler discoverPeerLoopHandler = new Handler();
+
+    private InetAddress groupOwnerAddress;
 
     private class Device{
         String name;
@@ -353,7 +370,9 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
             new WifiP2pManager.ConnectionInfoListener() {
                 @Override
                 public void onConnectionInfoAvailable(WifiP2pInfo info) {
-                    InetAddress groupOwnerAddress = info.groupOwnerAddress;
+                    synchronized (this){
+                        groupOwnerAddress = info.groupOwnerAddress;
+                    }
                     Log.i(TAG, String.format("WifiDirect: group owner address %s",groupOwnerAddress.getHostAddress()));
                     if (info.groupFormed && info.isGroupOwner) {
                         // Do whatever tasks are specific to the group owner.
@@ -368,42 +387,63 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
                         Log.i(TAG, "WifiDirect: this is group client");
                         isWifiDirectGroupOwner = false;
                     }
+
+                    if (!startedSocketServer && isWifiDirectConnected && isWifiDirectGroupOwner){ // Socket server
+                        new SocketServerFrameTask().execute(SOCKET_PORT);
+                    }
+                    /*else if (isWifiDirectConnected && !isWifiDirectGroupOwner){ // socket client
+                        new SocketClientTask().execute(groupOwnerAddress.getHostAddress());
+                    }*/
                 }
             };
 
+    public void connect(final Device d){
+        WifiP2pDevice device = d.wifiP2pDevice;
+
+        WifiP2pConfig config = new WifiP2pConfig();
+        config.deviceAddress = device.deviceAddress;
+        config.wps.setup = WpsInfo.PBC;
+        if (d.name == "red"){
+            config.groupOwnerIntent = 10;
+        } else {
+            config.groupOwnerIntent = 1;
+        }
+        mManager.connect(mChannel, config, new WifiP2pManager.ActionListener() {
+
+            @Override
+            public void onSuccess() {
+                // WiFiDirectBroadcastReceiver notifies us. Ignore for now.
+                Log.d(TAG, "WifiDirect: mManager.connect onSuccess");
+                synchronized (this) {
+                    recentPeer = d;
+                }
+                discoverPeerLoopHandler.removeCallbacksAndMessages(null);
+            }
+
+            @Override
+            public void onFailure(int reason) {
+                Log.d(TAG, String.format("WifiDirect: mManager.connect onFailure %d",reason));
+                recentPeer = null;
+                discoverPeerLoopHandler.postDelayed(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (mManager != null) {
+                            discoverPeersUntilSuccess();
+                        }
+                    }
+                    }, 1000);
+            }
+        });
+    }
     public void connect( List<Device> devices) {
         if (devices.size() == 0 || mManager == null || mChannel == null){
             return;
         }
         // Picking the first device found on the network.
         for (final Device d: devices) {
-            WifiP2pDevice device = d.wifiP2pDevice;
-
-            WifiP2pConfig config = new WifiP2pConfig();
-            config.deviceAddress = device.deviceAddress;
-            config.wps.setup = WpsInfo.PBC;
-            if (d.name == "red"){
-                config.groupOwnerIntent = 10;
-            } else {
-                config.groupOwnerIntent = 1;
-            }
-            mManager.connect(mChannel, config, new WifiP2pManager.ActionListener() {
-
-                @Override
-                public void onSuccess() {
-                    // WiFiDirectBroadcastReceiver notifies us. Ignore for now.
-                    Log.d(TAG, "WifiDirect: mManager.connect onSuccess");
-                    recentPeer = d;
-                    //connectedWifiPeers.add(d);
-                }
-
-                @Override
-                public void onFailure(int reason) {
-                    Log.d(TAG, String.format("WifiDirect: mManager.connect onFailure %d",reason));
-                    recentPeer = null;
-                }
-            });
+            connect(d);
         }
+
     }
 
     private WifiP2pManager.PeerListListener peerListListener = new WifiP2pManager.PeerListListener() {
@@ -411,7 +451,7 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
         public void onPeersAvailable(WifiP2pDeviceList peerList) {
             List<WifiP2pDevice> refreshedPeers = new ArrayList(peerList.getDeviceList());
 
-            if (!refreshedPeers.equals(peers)) {
+            if (!refreshedPeers.containsAll(peers) || !peers.containsAll(refreshedPeers)) {
                 peers.clear();
                 peers.addAll(refreshedPeers);
             }
@@ -480,9 +520,11 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
                 //Log.d(TAG, String.format("WifiDirect: networkInfo %s",networkInfo.getExtraInfo()));
                 if (networkInfo.isConnected()) {
                     mManager.requestConnectionInfo(mChannel, mConnectionInfoListener);
-                    isWifiDirectConnected = true;
-                    if (recentPeer != null){
-                        connectedWifiPeers.add(recentPeer);
+                    synchronized (this) {
+                        isWifiDirectConnected = true;
+                        if (recentPeer != null) {
+                            connectedWifiPeers.add(recentPeer);
+                        }
                     }
                     Log.d(TAG, "WifiDirect: isConnected");
                 } else {
@@ -492,6 +534,297 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
             } else if (WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION.equals(action)) {
 
             }
+        }
+    }
+    // used for sending camera frame
+    private class SocketClientFrameTask extends AsyncTask<byte[], Integer, String>{
+        @Override
+        protected void onPreExecute(){
+            super.onPreExecute();
+            sent_frame = true; // control to send only one frame (testing)
+            Log.i(TAG, "WifiDirect: SocketClientFrameTask onPreExecute()");
+        }
+
+        @Override
+        protected String doInBackground(byte[]... params){
+            Log.i(TAG, "WifiDirect: SocketClientFrameTask doInBackground()");
+            InetAddress serverInetAddr = groupOwnerAddress;
+            byte[] byteData = params[0];
+            Log.i(TAG, String.format("WifiDirect: SocketClientFrameTask doInBackground() byteData %d mid byte %d",byteData.length,(int) byteData[byteData.length/2]));
+            if (serverInetAddr == null) {
+                return "Server ip unknown";
+            }
+
+            Log.i(TAG, String.format("WifiDirect: SocketClientFrameTask doInBackground() server name: %s ip: %s",serverInetAddr.getHostName(),serverInetAddr.getHostAddress()));
+            Socket socket;
+            ByteArrayInputStream byteInput;
+            DataOutputStream dataOutput;
+            ObjectInputStream input;
+            final int SOCKET_TIMEOUT = 5000;
+            try {
+                socket = new Socket();
+                socket.bind(null);
+                socket.connect((new InetSocketAddress(serverInetAddr, SOCKET_PORT)),SOCKET_TIMEOUT);
+                if (socket == null) return "null socket";
+
+                Log.d(TAG, "WifiDirect: SocketClientFrameTask Client socket - " + socket.isConnected());
+                byteInput = new ByteArrayInputStream(byteData);
+                dataOutput = new DataOutputStream(socket.getOutputStream());
+                int count;
+                int accum = 0;
+                byte[] buffer = new byte[8*1024];
+                while ((count = byteInput.read(buffer)) > 0){ // assume knowing data size client side should have reliable data
+                    dataOutput.write(buffer, 0, count);
+                    Log.i(TAG, String.format("WifiDirect: SocketClientFrameTask count %d input available %d output size %d",count,byteInput.available(),dataOutput.size()));
+                    if (byteInput.available() <= 0) break;
+                }
+                dataOutput.flush();
+                Log.i(TAG, String.format("WifiDirect: SocketClientFrameTask done dataOutput.flush()"));
+                input = new ObjectInputStream(socket.getInputStream());
+                try {
+                    String message = (String) input.readObject();
+                    Log.i(TAG, String.format("WifiDirect: SocketClientFrameTask Msg from server %s", message));
+                } catch (ClassNotFoundException e) {
+                    e.printStackTrace();
+                }
+
+                byteInput.close();
+                dataOutput.close();
+                input.close();
+                socket.close();
+            } catch (IOException e){
+                e.printStackTrace();
+            }
+
+            return "Socket Client finished!";
+        }
+
+        @Override
+        protected void onProgressUpdate(Integer... values){
+            super.onProgressUpdate(values);
+            Log.i(TAG, "WifiDirect: SocketClientFrameTask onProgressUpdate()");
+        }
+
+        @Override
+        protected void onPostExecute(String result){
+            super.onPostExecute(result);
+            Log.i(TAG, String.format("WifiDirect: SocketClientFrameTask onPostExecute() %s",result));
+        }
+    }
+
+    private class SocketServerFrameTask extends AsyncTask<Integer, Integer, String>{
+        @Override
+        protected void onPreExecute(){
+            super.onPreExecute();
+            Log.i(TAG, "WifiDirect: SocketServerFrameTask onPreExecute()");
+            startedSocketServer = true;
+        }
+
+        @Override
+        protected String doInBackground(Integer... params){
+            Log.i(TAG, "WifiDirect: SocketServerFrameTask doInBackground()");
+            int port = params[0];
+            Log.i(TAG, String.format("WifiDirect: SocketServerFrameTask doInBackground() port %d",port));
+            try {
+                server = new ServerSocket(port);
+                while (true){
+                    Log.i(TAG, "WifiDirect: SocketServerFrameTask doInBackground() server waiting for client to connect");
+                    Socket socket = null;
+                    try {
+                        socket = server.accept();
+                    } catch(  SecurityException | SocketTimeoutException | IllegalBlockingModeException e){
+                        e.printStackTrace();
+                    }
+                    if (socket == null ) return "Null socket";
+
+                    DataInputStream dis = new DataInputStream(socket.getInputStream());
+                    ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                    //Log.i(TAG, String.format("WifiDirect: SocketServerFrameTask dis available: %d",dis.available()));
+                    int count;
+                    int accumCount = 0;
+                    byte[] buffer = new byte[8*1024];
+                    while ((count = dis.read(buffer)) > 0 ){
+                        accumCount += count;
+                        Log.i(TAG, String.format("WifiDirect: SocketServerFrameTask count %d accum %d",count,accumCount));
+                        bos.write(buffer, 0, count);
+                        Log.i(TAG, String.format("WifiDirect: SocketServerFrameTask bos.size() %d",bos.size()));
+                        if (bos.size() >= 307202) break;
+                    }
+                    byte[] receivedData = bos.toByteArray();
+                    //inputdata = IOUtils.toByteArray(dis);
+                    //dis.readFully(inputdata);
+                    Log.i(TAG, String.format("WifiDirect: SocketServerFrameTask frame received len: %d midbyte: %d",receivedData.length,(int) receivedData[receivedData.length/2]));
+                    ObjectOutputStream oos = new ObjectOutputStream(socket.getOutputStream());
+                    oos.writeObject("ack");
+                    dis.close();
+                    bos.close();
+                    oos.close();
+                    socket.close();
+                    break;
+                }
+                server.close();
+            } catch (IOException e){
+                e.printStackTrace();
+            }
+
+            return "Socket Server finished!";
+        }
+
+        @Override
+        protected void onProgressUpdate(Integer... values){
+            super.onProgressUpdate(values);
+            Log.i(TAG, "WifiDirect: SocketServerFrameTask onProgressUpdate()");
+        }
+
+        @Override
+        protected void onPostExecute(String result){
+            super.onPostExecute(result);
+            Log.i(TAG, String.format("WifiDirect: SocketServerFrameTask onPostExecute() %s",result));
+            startedSocketServer = false;
+        }
+    }
+    private class SocketClientTask extends AsyncTask<String, Integer, String>{
+        @Override
+        protected void onPreExecute(){
+            super.onPreExecute();
+            Log.i(TAG, "WifiDirect: SocketClientTask onPreExecute()");
+        }
+
+        @Override
+        protected String doInBackground(String... params){
+            Log.i(TAG, "WifiDirect: SocketClientTask doInBackground()");
+            InetAddress serverInetAddr = null;
+            try {
+                serverInetAddr = InetAddress.getByName(params[0]);
+            } catch (UnknownHostException e){
+                e.printStackTrace();
+            }
+
+            if (serverInetAddr == null) {
+                return "Server ip unknown";
+            }
+
+            Log.i(TAG, String.format("WifiDirect: SocketClientTask doInBackground() server name: %s ip: %s",serverInetAddr.getHostName(),serverInetAddr.getHostAddress()));
+            Socket socket;
+            ObjectOutputStream output;
+            ObjectInputStream input;
+            final int SOCKET_TIMEOUT = 5000;
+            try {
+                for (int i = 0; i < 5; i++) {
+                    Log.i(TAG, String.format("WifiDirect: SocketClientTask doInBackground() loop %d", i));
+                    socket = new Socket();
+                    socket.bind(null);
+                    socket.connect((new InetSocketAddress(serverInetAddr, SOCKET_PORT)),SOCKET_TIMEOUT);
+
+                    if (socket == null) return "null socket at"+i;
+                    Log.d(TAG, "WifiDirect: Client socket - " + socket.isConnected());
+                    output = new ObjectOutputStream(socket.getOutputStream());
+                    Log.i(TAG, String.format("WifiDirect: SocketClientTask doInBackground() after output stream constructed"));
+                    if (output != null) {
+                        if (i == 4) {
+                            output.writeObject("exit");
+                        } else {
+                            output.writeObject("" + i);
+                        }
+                    }
+                    input = new ObjectInputStream(socket.getInputStream());
+                    if (input != null) {
+                        try {
+                            String message = (String) input.readObject();
+                            Log.i(TAG, String.format("WifiDirect: Msg from server %s", message));
+                        } catch (ClassNotFoundException e) {
+                            e.printStackTrace();
+                        }
+                    }
+                    input.close();
+                    output.close();
+                    try {
+                        Thread.sleep(100);
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    }
+                }
+            } catch (IOException e){
+                    e.printStackTrace();
+            }
+
+            return "Socket Client finished!";
+        }
+
+        @Override
+        protected void onProgressUpdate(Integer... values){
+            super.onProgressUpdate(values);
+            Log.i(TAG, "WifiDirect: SocketClientTask onProgressUpdate()");
+        }
+
+        @Override
+        protected void onPostExecute(String result){
+            super.onPostExecute(result);
+            Log.i(TAG, String.format("WifiDirect: SocketClientTask onPostExecute() %s",result));
+        }
+    }
+
+    private class SocketServerTask extends AsyncTask<Integer, Integer, String>{
+        @Override
+        protected void onPreExecute(){
+            super.onPreExecute();
+            Log.i(TAG, "WifiDirect: SocketServerTask onPreExecute()");
+            startedSocketServer = true;
+        }
+
+        @Override
+        protected String doInBackground(Integer... params){
+            Log.i(TAG, "WifiDirect: SocketServerTask doInBackground()");
+            int port = params[0];
+            Log.i(TAG, String.format("WifiDirect: SocketServerTask doInBackground() port %d",port));
+            try {
+                server = new ServerSocket(port);
+                while (true){
+                    Log.i(TAG, "WifiDirect: SocketServerTask doInBackground() server waiting for client to connect");
+                    Socket socket = null;
+                    try {
+                        socket = server.accept();
+                    } catch(  SecurityException | SocketTimeoutException | IllegalBlockingModeException e){
+                        e.printStackTrace();
+                    }
+                    if (socket == null ) return "Null socket";
+
+                    ObjectInputStream ois = new ObjectInputStream(socket.getInputStream());
+                    String message = null;
+                    try {
+                        message = (String) ois.readObject();
+                    } catch (ClassNotFoundException e){
+                        e.printStackTrace();
+                    }
+                    Log.i(TAG, String.format("WifiDirect: SocketServerTask Message received: %s",message));
+                    ObjectOutputStream oos = new ObjectOutputStream(socket.getOutputStream());
+                    if (message != null) oos.writeObject("Hi client did you say "+ message);
+                    ois.close();
+                    oos.close();
+                    socket.close();
+                    if (message != null && message.equalsIgnoreCase("exit")){
+                        break;
+                    }
+                }
+                server.close();
+            } catch (IOException e){
+                e.printStackTrace();
+            }
+
+            return "Socket Server finished!";
+        }
+
+        @Override
+        protected void onProgressUpdate(Integer... values){
+            super.onProgressUpdate(values);
+            Log.i(TAG, "WifiDirect: SocketServerTask onProgressUpdate()");
+        }
+
+        @Override
+        protected void onPostExecute(String result){
+            super.onPostExecute(result);
+            Log.i(TAG, String.format("WifiDirect: SocketServerTask onPostExecute() %s",result));
+            startedSocketServer = false;
         }
     }
     private final ConnectionLifecycleCallback connectionLifecycleCallback =
@@ -1050,7 +1383,7 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
         android_id = Secure.getString(this.getContentResolver(), Secure.ANDROID_ID);
         Log.i(TAG, String.format("Android Unique ID: %s",android_id));
         addKnownPeers();
-        //setRoles();
+        setRoles();
         SERVICE_ID = this.getPackageName();
         Log.i(TAG, String.format("SERVICE_ID: %s",SERVICE_ID));
         Log.i(TAG, String.format("displayWidth: %d displayHeight: %d",displayWidth,displayHeight));
@@ -1081,6 +1414,14 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
 
         Log.i(TAG, "WifiDirect: init wifi direct done");
 
+        discoverPeersUntilSuccess();
+    }
+
+    private void discoverPeersUntilSuccess(){
+        if (mManager == null || mChannel == null){
+            Log.e(TAG, "WifiDirect: discoverPeersUntilSuccess mManager or mChannel is null ");
+            return;
+        }
         mManager.discoverPeers(mChannel, new WifiP2pManager.ActionListener() {
 
             @Override
@@ -1090,6 +1431,7 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
                 // can often be left blank. Code for peer discovery goes in the
                 // onReceive method, detailed below.
                 Log.i(TAG, "WifiDirect: discoverPeers onSuccess");
+                discoverPeerLoopHandler.removeCallbacksAndMessages(null);
             }
 
             @Override
@@ -1097,6 +1439,14 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
                 // Code for when the discovery initiation fails goes here.
                 // Alert the user that something went wrong.
                 Log.i(TAG, String.format("WifiDirect: discoverPeers onFailure reasonCode %d", reasonCode));
+                discoverPeerLoopHandler.postDelayed(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (mManager != null) {
+                            discoverPeersUntilSuccess();
+                        }
+                    }
+                }, 1500);
             }
         });
     }
@@ -1192,6 +1542,16 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
         Nearby.getConnectionsClient(getApplicationContext()).stopDiscovery();
     }
 
+    private void listWifiConnectedPeers(){
+        Log.i(TAG, String.format("WifiDirect: number wifi connected peers: %d",
+                connectedWifiPeers.size()));
+
+        if (connectedWifiPeers.size() == 0) return;
+
+        for (Device d: connectedWifiPeers){
+            Log.i(TAG, String.format("WifiDirect: wifi connected peers: %s",d.toString()));
+        }
+    }
     private void listConnectedPeers() {
         Log.i(TAG, String.format("Nearby: Number connectedPeers: %d connected epid: %d",
                 connectedPeers.size(), connectedEPID.size()));
@@ -1768,14 +2128,17 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
             image.close();
 
             if (countVINS % 60 == 0) {
-                listConnectedPeers();
+                //listWifiConnectedPeers();
             }
-
-            int sendFramePeriod = 120;
-            if (connectedPeers.size() > 0 &&
+            //if (isWifiDirectConnected && !isWifiDirectGroupOwner)
+            //int sendFramePeriod = 120;
+            if (!sent_frame &&
                     thisDevice.name == "green" &&
+                    connectedWifiPeers.size() > 0 &&
+                    isWifiDirectConnected &&
+                    !isWifiDirectGroupOwner
                     //countVINS % sendFramePeriod == 0 &&
-                    !sent_frame) {
+                    ) {
                 final long startMs = System.currentTimeMillis();
                 byte[] yBytes = new byte[(yuvBytes[0].length) + 2];
                 yBytes[0] = (byte) 3; // messageID
@@ -1783,14 +2146,15 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
                 System.arraycopy(yuvBytes[0], 0, yBytes, 2, yuvBytes[0].length);
                 Log.i(TAG, String.format("Nearby: yBytes[0] %d length %d", yBytes[0], yBytes.length));
                 Log.i(TAG, String.format("Nearby: ConnectionsClient.MAX_BYTES_DATA_SIZE %d", ConnectionsClient.MAX_BYTES_DATA_SIZE));
-                yStream = new ByteArrayInputStream(yBytes);
-                /*ParcelFileDescriptor pfdYBytes = null;
+
+                new SocketClientFrameTask().execute(yBytes);
+                /*yStream = new ByteArrayInputStream(yBytes);
+                ParcelFileDescriptor pfdYBytes = null;
                 try {
                     pfdYBytes = getFileDescriptor(yBytes);
                 } catch (IOException e){
 
-                }*/
-                /*
+                }
                 byte[] targetArray = null;
                 try {
                     targetArray = new byte[yStream.available()];
@@ -1803,7 +2167,7 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
                 //Log.i(TAG, String.format("Prepare frame to send %d ms",System.currentTimeMillis()-startMs));
                 */
                 //stopDiscovery();
-                sent_frame = true;
+
                 /*
                 int first_index = 0;
                 int last_index = ConnectionsClient.MAX_BYTES_DATA_SIZE;
@@ -1813,12 +2177,12 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
                     last_index += ConnectionsClient.MAX_BYTES_DATA_SIZE;
                 }
                 sendByte2AllPeers(Arrays.copyOfRange(yBytes,first_index,yBytes.length));
-                */
+
                 Log.i(TAG, String.format("Nearby: start sending frame at %d",System.currentTimeMillis()));
                 if (yStream != null){
                     sendStream2AllPeers(yStream);
                 }
-                /*try{
+                try{
                     Log.i(TAG, String.format("Nearby: yStream.available() %d", yStream.available()));
                     while (yStream.available() > 0){
                         Log.i(TAG, String.format("Nearby: yStream.available() %d", yStream.available()));
